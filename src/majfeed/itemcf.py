@@ -1,6 +1,7 @@
 from collections.abc import Iterable
 from datetime import datetime
 from typing import TypedDict
+from uuid import UUID
 
 import numpy as np
 from bson import ObjectId
@@ -12,12 +13,12 @@ from .publication import save_neighbors
 
 class InteractionPair(TypedDict):
     userId: ObjectId
-    chartHash: str
+    chartId: UUID  # MaiChart.Id
     weight: float
 
 
 class Neighbor(TypedDict):
-    hash: str
+    chartId: UUID
     score: float
 
 
@@ -40,7 +41,8 @@ def load_pairs(
     if time_filter:
         pipeline.append({"$match": {"Timestamp": time_filter}})
 
-    # 按 Hash 关联当前谱面，$unwind 会排除找不到谱面的成绩记录。
+    # 成绩仍以 maidata MD5 为键：按 Hash 关联当前谱面并取其 Id，$unwind 会排除找不到谱面的成绩记录。
+    # 上传时拒绝重复 Hash，一个 Hash 只对应一张现存谱面。
     pipeline.extend([
         {
             "$lookup": {
@@ -56,7 +58,7 @@ def load_pairs(
             "$group": {
                 "_id": {
                     "userId": "$PlayerId",
-                    "chartHash": "$chart.Hash",
+                    "chartId": "$chart._id",
                 }
             }
         },
@@ -64,7 +66,7 @@ def load_pairs(
             "$project": {
                 "_id": 0,
                 "userId": "$_id.userId",
-                "chartHash": "$_id.chartHash",
+                "chartId": "$_id.chartId",
                 "weight": {"$literal": 1.0},  # 用 $literal 返回常量，而不是保留同名字段。
             }
         },
@@ -81,7 +83,7 @@ UPVOTE = 1  # mmfcapi 的 VoteKind.Upvote，枚举按整数存储；点踩为 -1
 
 
 def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = None) -> list[dict]:
-    """筛选点赞 → 关联当前谱面 → 排除已删除账号 → 按用户与谱面去重。"""
+    """筛选点赞 → 按 Hash 关联当前谱面 → 排除已删除账号 → 按用户与谱面 Id 去重。"""
     return [
         {"$match": match},
         {
@@ -108,7 +110,7 @@ def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = Non
             "$group": {
                 "_id": {
                     "userId": f"${user_field}",
-                    "chartHash": "$chart.Hash",
+                    "chartId": "$chart._id",
                 }
             }
         },
@@ -116,7 +118,7 @@ def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = Non
             "$project": {
                 "_id": 0,
                 "userId": "$_id.userId",
-                "chartHash": "$_id.chartHash",
+                "chartId": "$_id.chartId",
                 "weight": {"$literal": 1.5},
             }
         },
@@ -143,15 +145,15 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
             with database[collection].aggregate(pipeline) as cursor:
                 for pair in cursor:
                     # ItemCF 会累加重复坐标，重复的点赞必须在这里去掉，否则权重变成 3.0。
-                    pairs.setdefault((pair["userId"], pair["chartHash"]), pair)
+                    pairs.setdefault((pair["userId"], pair["chartId"]), pair)
     return list(pairs.values())
 
 
 def build_itemcf(
     pairs: Iterable[InteractionPair], k: int = 100
-) -> dict[str, list[Neighbor]]:
-    """计算带交互权重的 IUF ItemCF，按谱面返回 Top-K 的 hash/score 列表。"""
-    # Hash/ObjectId 映射到连续整数索引：用户对应行，谱面对应列。
+) -> dict[UUID, list[Neighbor]]:
+    """计算带交互权重的 IUF ItemCF，按谱面 Id 返回 Top-K 的 chartId/score 列表。"""
+    # 谱面 UUID / 用户 ObjectId 映射到连续整数索引：用户对应行，谱面对应列。
     user_to_idx = {}
     chart_to_idx = {}
     rows = []
@@ -159,13 +161,13 @@ def build_itemcf(
     vals = []
     for record in pairs:
         user_id = record["userId"]
-        chart_hash = record["chartHash"]
+        chart_id = record["chartId"]
         if user_id not in user_to_idx:
             user_to_idx[user_id] = len(user_to_idx)
-        if chart_hash not in chart_to_idx:
-            chart_to_idx[chart_hash] = len(chart_to_idx)
+        if chart_id not in chart_to_idx:
+            chart_to_idx[chart_id] = len(chart_to_idx)
         rows.append(user_to_idx[user_id])
-        cols.append(chart_to_idx[chart_hash])
+        cols.append(chart_to_idx[chart_id])
         vals.append(record["weight"])
 
     # COO 转 CSR 时会合并重复坐标，游玩 1.0 加点赞 1.5 就得到权重 2.5。
@@ -205,7 +207,7 @@ def build_itemcf(
         neighbor_scores = similarity_matrix.data[start:end]
         topks[idx_to_chart[i]] = [
             {
-                "hash": idx_to_chart[int(neighbor_indices[idx])],
+                "chartId": idx_to_chart[int(neighbor_indices[idx])],
                 "score": float(neighbor_scores[idx]),
             }
             for idx in range(min(k,len(neighbor_indices)))

@@ -10,16 +10,20 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 from bson import ObjectId
+from bson.binary import UUID_SUBTYPE, UuidRepresentation
+from bson.codec_options import CodecOptions
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError
 from pymongo.results import BulkWriteResult
 
+from main import MODEL_NAME
 from majfeed.itemcf import load_like_pairs, load_pairs, save_neighbors
-from majfeed.publication import cleanup_old_versions, make_model_version
+from majfeed.publication import cleanup_old_versions, make_model_version, neighbor_list_id
 
-V1 = "itemcf-20261011:000001"
-V2 = "itemcf-20261011:000002"
+V1 = f"{MODEL_NAME}-20261011:000001"
+V2 = f"{MODEL_NAME}-20261011:000002"
+OLD, NEW = UUID(int=0xA0), UUID(int=0xB0)
 
 
 class MongoWriteChecks(unittest.TestCase):
@@ -35,10 +39,11 @@ class MongoWriteChecks(unittest.TestCase):
         self.client.close()
 
     def test_bson_contract_batching_and_immutable_versions(self):
-        low, high = "hash-low+/=", "hash-high+/="
+        low, high = UUID(int=1), UUID("FFFFFFFF-0000-4000-8000-0000000000AB")
+        sources = [UUID(int=1000 + i) for i in range(1, 502)]
         topks = {
-            f"hash-{i}": [{"hash": low, "score": 0.25}, {"hash": high, "score": 0.75}]
-            for i in range(1, 502)
+            source: [{"chartId": low, "score": 0.25}, {"chartId": high, "score": 0.75}]
+            for source in sources
         }
         written = save_neighbors(self.uri, self.database_name, topks, V1)
         self.assertEqual(written, 501)
@@ -46,29 +51,35 @@ class MongoWriteChecks(unittest.TestCase):
         docs = list(self.db.ChartNeighbors.find())
         self.assertEqual(len({doc["GeneratedAt"] for doc in docs}), 1)
         for doc in docs:
-            self.assertEqual(set(doc), {"_id", "ChartHash", "ModelVersion", "GeneratedAt", "Neighbors"})
-            self.assertEqual(doc["_id"], f"{V1}|{doc['ChartHash']}")
+            self.assertEqual(set(doc), {"_id", "ChartId", "ModelVersion", "GeneratedAt", "Neighbors"})
+            self.assertIsInstance(doc["ChartId"], UUID)
+            self.assertEqual(doc["_id"], f"{V1}|{str(doc['ChartId']).lower()}")
             self.assertEqual(doc["ModelVersion"], V1)
             self.assertIsInstance(doc["GeneratedAt"], datetime)
             self.assertEqual(doc["GeneratedAt"].utcoffset(), timedelta(0))
             self.assertEqual(doc["Neighbors"], [
-                {"ChartHash": high, "Score": 0.75},
-                {"ChartHash": low, "Score": 0.25},
+                {"ChartId": high, "Score": 0.75},
+                {"ChartId": low, "Score": 0.25},
             ])
-            self.assertIsInstance(doc["Neighbors"][0]["ChartHash"], str)
             self.assertIsInstance(doc["Neighbors"][0]["Score"], float)
+        # mmfcapi 以 GuidRepresentation.Standard 读取：ChartId 必须是 BSON binary subtype 4，而不是字符串。
+        raw = self.db.with_options(codec_options=CodecOptions(uuid_representation=UuidRepresentation.UNSPECIFIED))
+        stored = raw.ChartNeighbors.find_one({"_id": neighbor_list_id(V1, sources[0])})
+        self.assertEqual(stored["ChartId"].subtype, UUID_SUBTYPE)
+        self.assertEqual(stored["Neighbors"][0]["ChartId"].subtype, UUID_SUBTYPE)
+        self.assertEqual(stored["_id"], f"{V1}|00000000-0000-0000-0000-0000000003e9")
 
         self.assertEqual(save_neighbors(
-            self.uri, self.database_name, {"hash-1": []}, V2
+            self.uri, self.database_name, {sources[0]: []}, V2
         ), 1)
         self.assertEqual(self.db.ChartNeighbors.count_documents({}), 502)
-        updated = self.db.ChartNeighbors.find_one({"_id": f"{V2}|hash-1"})
+        updated = self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(V2, sources[0])})
         self.assertEqual(updated["Neighbors"], [])
-        self.assertEqual(self.db.ChartNeighbors.find_one({"_id": f"{V1}|hash-1"})["ModelVersion"], V1)
+        self.assertEqual(self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(V1, sources[0])})["ModelVersion"], V1)
         self.assertEqual(self.db.RecommendationModels.find_one({"_id": V1})["ChartCount"], 501)
         self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": V2})["PublishedAt"])
         with self.assertRaises(DuplicateKeyError):
-            save_neighbors(self.uri, self.database_name, {"hash-1": []}, V1)
+            save_neighbors(self.uri, self.database_name, {sources[0]: []}, V1)
         self.assertEqual(self.db.ChartNeighbors.count_documents({}), 502)
 
     def test_empty_result_does_not_write_documents(self):
@@ -102,11 +113,16 @@ class MongoWriteChecks(unittest.TestCase):
 
         now = datetime.now(timezone.utc)
         for hours in (4, 3, 2):
-            old_version = make_model_version(generated_at=now - timedelta(hours=hours))
-            save_neighbors(self.uri, self.database_name, {"old": []}, old_version)
+            old_version = make_model_version(MODEL_NAME, now - timedelta(hours=hours))
+            save_neighbors(self.uri, self.database_name, {OLD: []}, old_version)
             self.db.RecommendationModels.update_one(
                 {"_id": old_version}, {"$set": {"PublishedAt": now - timedelta(hours=hours)}}
             )
+        # 按 Hash 写入的旧模型由旧后端读取，本任务不回收它。
+        legacy_version = make_model_version("itemcf", now - timedelta(hours=5))
+        self.db.RecommendationModels.insert_one({
+            "_id": legacy_version, "Model": "itemcf", "PublishedAt": now - timedelta(hours=5),
+        })
         root = Path(__file__).resolve().parents[1]
         process = subprocess.run(
             [sys.executable, str(root / "src/main.py")],
@@ -115,7 +131,6 @@ class MongoWriteChecks(unittest.TestCase):
                 **os.environ,
                 "MONGO_URI": self.uri,
                 "MONGO_DATABASE": self.database_name,
-                "MODEL_NAME": "itemcf",
                 "TOP_K": "1",
             },
             capture_output=True,
@@ -125,7 +140,7 @@ class MongoWriteChecks(unittest.TestCase):
         )
         output = json.loads(process.stdout)
         version = output.pop("model_version")
-        self.assertRegex(version, r"^itemcf-\d{8}:\d{6}$")
+        self.assertRegex(version, r"^itemcf-id-\d{8}:\d{6}$")
         self.assertEqual(output, {
             "k": 1,
             "play_pairs": 4,
@@ -136,30 +151,34 @@ class MongoWriteChecks(unittest.TestCase):
 
         # A 的权重为 [2.5, 1]，B 为 [1, 1.5]，两位用户分别接触 2、3 张谱面。
         expected_ab = (2.5 / math.log(3) + 1.5 / math.log(4)) / math.sqrt(7.25 * 3.25)
-        docs = {doc["ChartHash"]: doc for doc in self.db.ChartNeighbors.find({"ModelVersion": version})}
-        self.assertEqual(set(docs), {"a", "b", "c"})
-        self.assertEqual(docs["a"]["ModelVersion"], version)
+        docs = {doc["ChartId"]: doc for doc in self.db.ChartNeighbors.find({"ModelVersion": version})}
+        self.assertEqual(set(docs), {a, b, c})
+        self.assertEqual(docs[a]["_id"], neighbor_list_id(version, a))
+        self.assertEqual(docs[a]["ModelVersion"], version)
         self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": version})["PublishedAt"])
-        self.assertEqual(docs["a"]["Neighbors"][0]["ChartHash"], "b")
-        self.assertAlmostEqual(docs["a"]["Neighbors"][0]["Score"], expected_ab, places=6)
-        self.assertEqual(docs["b"]["Neighbors"][0]["ChartHash"], "a")
-        self.assertEqual(docs["c"]["Neighbors"][0]["ChartHash"], "b")
+        self.assertEqual(docs[a]["Neighbors"][0]["ChartId"], b)
+        self.assertAlmostEqual(docs[a]["Neighbors"][0]["Score"], expected_ab, places=6)
+        self.assertEqual(docs[b]["Neighbors"][0]["ChartId"], a)
+        self.assertEqual(docs[c]["Neighbors"][0]["ChartId"], b)
         self.assertTrue(all(len(doc["Neighbors"]) == 1 for doc in docs.values()))
+        self.assertEqual(self.db.RecommendationModels.count_documents({"Model": MODEL_NAME, "PublishedAt": {"$ne": None}}), 2)
+        self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": legacy_version}))
 
-        # 同 Hash 的谱面换成新 UUID 后，历史交互和已存近邻依然用同一标识关联。
+        # 删除后按同一 Hash 重新上传会得到新 UUID：交互仍按 Hash 关联，但训练键换成新谱面的 Id；
+        # 已发布的近邻仍指向旧 Id，下一轮训练才会按新 Id 生成。
         plays_before = load_pairs(self.uri, self.database_name)
         likes_before = load_like_pairs(self.uri, self.database_name)
-        self.assertTrue(all(set(pair) == {"userId", "chartHash", "weight"} for pair in plays_before + likes_before))
+        self.assertTrue(all(set(pair) == {"userId", "chartId", "weight"} for pair in plays_before + likes_before))
+        renamed = {old: uuid4() for old in (a, b, c)}
         self.db.MaiCharts.delete_many({"_id": {"$in": [a, b, c]}})
         self.db.MaiCharts.insert_many([
-            {"_id": uuid4(), "Hash": chart_hash} for chart_hash in ["a", "b", "c"]
+            {"_id": renamed[old], "Hash": chart_hash} for old, chart_hash in zip((a, b, c), "abc")
         ])
-        to_keys = lambda pairs: {(p["userId"], p["chartHash"], p["weight"]) for p in pairs}
-        self.assertEqual(to_keys(plays_before), to_keys(load_pairs(self.uri, self.database_name)))
-        self.assertEqual(to_keys(likes_before), to_keys(load_like_pairs(self.uri, self.database_name)))
-        self.assertEqual(self.db.ChartNeighbors.find_one({"_id": f"{version}|a"})["Neighbors"], docs["a"]["Neighbors"])
+        to_keys = lambda pairs, ids={}: {(p["userId"], ids.get(p["chartId"], p["chartId"]), p["weight"]) for p in pairs}
+        self.assertEqual(to_keys(plays_before, renamed), to_keys(load_pairs(self.uri, self.database_name)))
+        self.assertEqual(to_keys(likes_before, renamed), to_keys(load_like_pairs(self.uri, self.database_name)))
+        self.assertEqual(self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(version, a)})["Neighbors"], docs[a]["Neighbors"])
         self.assertEqual(self.db.ChartNeighbors.count_documents({"ModelVersion": version}), 3)
-        self.assertEqual(self.db.RecommendationModels.count_documents({"Model": "itemcf", "PublishedAt": {"$ne": None}}), 2)
 
 
     def test_like_pairs_read_upvotes_and_legacy_likes_once(self):
@@ -179,12 +198,12 @@ class MongoWriteChecks(unittest.TestCase):
         ])
         pairs = load_like_pairs(self.uri, self.database_name)
         self.assertEqual(
-            sorted((p["userId"], p["chartHash"], p["weight"]) for p in pairs),
-            [(u1, "a", 1.5), (u2, "a", 1.5), (u2, "c", 1.5)],
+            sorted((p["userId"], p["chartId"], p["weight"]) for p in pairs),
+            [(u1, UUID(int=1), 1.5), (u2, UUID(int=1), 1.5), (u2, UUID(int=3), 1.5)],
         )
 
     def test_partial_batch_failure_keeps_version_unpublished_and_old_data_unchanged(self):
-        save_neighbors(self.uri, self.database_name, {"old": []}, V1)
+        save_neighbors(self.uri, self.database_name, {OLD: []}, V1)
         original_write = Collection.bulk_write
         calls = 0
 
@@ -197,26 +216,26 @@ class MongoWriteChecks(unittest.TestCase):
 
         with patch.object(Collection, "bulk_write", new=fail_second_batch):
             with self.assertRaisesRegex(RuntimeError, "simulated batch"):
-                save_neighbors(self.uri, self.database_name, {f"a-{i}": [] for i in range(501)}, V2)
+                save_neighbors(self.uri, self.database_name, {UUID(int=i + 1): [] for i in range(501)}, V2)
         self.assertEqual(self.db.ChartNeighbors.count_documents({"ModelVersion": V2}), 500)
         self.assertIsNone(self.db.RecommendationModels.find_one({"_id": V2})["PublishedAt"])
         self.assertEqual(self.db.RecommendationModels.find_one(
-            {"Model": "itemcf", "PublishedAt": {"$ne": None}}, sort=[("_id", -1)]
+            {"Model": MODEL_NAME, "PublishedAt": {"$ne": None}}, sort=[("_id", -1)]
         )["_id"], V1)
-        self.assertIsNotNone(self.db.ChartNeighbors.find_one({"_id": f"{V1}|old"}))
+        self.assertIsNotNone(self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(V1, OLD)}))
 
     def test_incomplete_write_receipt_does_not_publish_or_clean_up(self):
-        save_neighbors(self.uri, self.database_name, {"old": []}, V1)
+        save_neighbors(self.uri, self.database_name, {OLD: []}, V1)
         with patch.object(Collection, "bulk_write", return_value=BulkWriteResult({"nInserted": 0}, True)):
             with self.assertRaisesRegex(RuntimeError, "Incomplete neighbor batch"):
-                save_neighbors(self.uri, self.database_name, {"new": []}, V2)
+                save_neighbors(self.uri, self.database_name, {NEW: []}, V2)
         self.assertIsNone(self.db.RecommendationModels.find_one({"_id": V2})["PublishedAt"])
-        self.assertIsNotNone(self.db.ChartNeighbors.find_one({"_id": f"{V1}|old"}))
+        self.assertIsNotNone(self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(V1, OLD)}))
 
     def test_unacknowledged_write_does_not_publish(self):
         with patch.object(Collection, "bulk_write", return_value=BulkWriteResult({}, False)):
             with self.assertRaisesRegex(RuntimeError, "Incomplete neighbor batch"):
-                save_neighbors(self.uri, self.database_name, {"new": []}, V1)
+                save_neighbors(self.uri, self.database_name, {NEW: []}, V1)
         self.assertIsNone(self.db.RecommendationModels.find_one({"_id": V1})["PublishedAt"])
 
     def test_successful_publication_does_not_read_back_neighbor_documents(self):
@@ -228,29 +247,29 @@ class MongoWriteChecks(unittest.TestCase):
             return original_find(collection, *args, **kwargs)
 
         with patch.object(Collection, "find", new=reject_neighbor_read):
-            self.assertEqual(save_neighbors(self.uri, self.database_name, {"source": []}, V1), 1)
+            self.assertEqual(save_neighbors(self.uri, self.database_name, {NEW: []}, V1), 1)
         self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": V1})["PublishedAt"])
 
     def test_cleanup_preserves_two_latest_releases_and_waits_since_supersession(self):
         now = datetime.now(timezone.utc)
-        versions = [f"itemcf-20261011:00000{i}" for i in range(1, 5)]
+        versions = [f"{MODEL_NAME}-20261011:00000{i}" for i in range(1, 5)]
         ages = [timedelta(hours=3), timedelta(hours=2), timedelta(minutes=10), timedelta(minutes=5)]
         for version, age in zip(versions, ages):
-            save_neighbors(self.uri, self.database_name, {"chart": []}, version)
+            save_neighbors(self.uri, self.database_name, {OLD: []}, version)
             self.db.RecommendationModels.update_one({"_id": version}, {"$set": {"PublishedAt": now - age}})
         # Publication never deletes anything, even when older data already exceeds the grace period.
         self.assertEqual(self.db.ChartNeighbors.count_documents({}), 4)
-        save_neighbors(self.uri, self.database_name, {"other": []}, "other-20261011:000001")
+        save_neighbors(self.uri, self.database_name, {NEW: []}, "other-20261011:000001")
         self.db.RecommendationModels.insert_one({
-            "_id": "itemcf-20990101:000000", "Model": "itemcf", "PublishedAt": None,
+            "_id": f"{MODEL_NAME}-20990101:000000", "Model": MODEL_NAME, "PublishedAt": None,
         })
-        self.assertEqual(cleanup_old_versions(self.db, "itemcf", now=now), 1)
+        self.assertEqual(cleanup_old_versions(self.db, MODEL_NAME, now=now), 1)
         self.assertIsNone(self.db.ChartNeighbors.find_one({"ModelVersion": versions[0]}))
         self.assertIsNotNone(self.db.ChartNeighbors.find_one({"ModelVersion": versions[1]}))
-        self.assertEqual(cleanup_old_versions(self.db, "itemcf", now=now + timedelta(hours=2)), 1)
-        self.assertEqual(set(self.db.RecommendationModels.distinct("_id", {"Model": "itemcf", "PublishedAt": {"$ne": None}})), set(versions[2:]))
+        self.assertEqual(cleanup_old_versions(self.db, MODEL_NAME, now=now + timedelta(hours=2)), 1)
+        self.assertEqual(set(self.db.RecommendationModels.distinct("_id", {"Model": MODEL_NAME, "PublishedAt": {"$ne": None}})), set(versions[2:]))
         self.assertIsNotNone(self.db.ChartNeighbors.find_one({"ModelVersion": "other-20261011:000001"}))
-        self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": "itemcf-20990101:000000"}))
+        self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": f"{MODEL_NAME}-20990101:000000"}))
 
 
 if __name__ == "__main__":
