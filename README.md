@@ -56,8 +56,10 @@ docker run --rm --platform linux/amd64 \
 ## 谱面标识与版本更新
 
 训练、评估和近邻回写统一使用 `MaiCharts.Hash`，区分大小写。游玩从
-`Scores.Hash` / `PlayHistory.Hash` 读取，点赞从 `ChartInteracts.ChartHash` 读取；
-仅保留能关联到当前谱面的交互，并按用户与 Hash 去重。
+`Scores.Hash` / `PlayHistory.Hash` 读取；点赞从 `ChartVotes` 中 `Kind = 1`（upvote）的
+`ChartHash` / `UserId` 读取，点踩不参与训练。旧版后端内嵌在 `ChartInteracts.Likes` 的点赞
+也会读取，后端启动迁移删掉该数组后自然不再命中，因此新旧后端都能训练。
+仅保留能关联到当前谱面、且账号仍存在的交互，并按用户与 Hash 去重。
 输入为 `userId/chartHash/weight`，Top-K 返回 `dict[str, list[{"hash": str, "score": float}]]`。
 
 每轮开始自动生成 `{model}-yyyyMMdd:HHmmss`（UTC），例如 `itemcf-20261012:000001`作为可排序的版本号，方便快速定位新版。

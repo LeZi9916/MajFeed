@@ -80,7 +80,7 @@ def run_time_split(
     k: int = 20,
 ) -> dict:
     """split 前训练，[split, end) 验证，使用实际游玩时间划分数据。"""
-    # Scores 记录最后更新时间，回测应读 PlayHistory；当前点赞也没有历史时间戳。
+    # Scores 记录最后更新时间，回测应读 PlayHistory；点赞只有最后改票时间，不加入回测。
     train_pairs = load_pairs(uri, database_name, collection="PlayHistory", end=split)
     validation_pairs = load_pairs(
         uri, database_name, collection="PlayHistory", start=split, end=end

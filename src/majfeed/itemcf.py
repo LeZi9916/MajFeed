@@ -75,10 +75,15 @@ def load_pairs(
             return list(cursor)
 
 
-def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
-    """提取当前有效的点赞关系，点赞权重为 1.5。"""
-    # Likes 只有当前用户列表，没有个人点赞时间，因此不用于历史时间切分。
-    pipeline = [
+VOTE_COLLECTION = "ChartVotes"
+LEGACY_LIKE_COLLECTION = "ChartInteracts"
+UPVOTE = 1  # mmfcapi 的 VoteKind.Upvote，枚举按整数存储；点踩为 -1。
+
+
+def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = None) -> list[dict]:
+    """筛选点赞 → 关联当前谱面 → 排除已删除账号 → 按用户与谱面去重。"""
+    return [
+        {"$match": match},
         {
             "$lookup": {
                 "from": "MaiCharts",
@@ -88,12 +93,12 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
             }
         },
         {"$unwind": "$chart"},
-        {"$unwind": "$Likes"},  # 将点赞用户数组展开成单个用户—谱面对。
+        *(expand or []),
         # 只保留仍然存在的账号，避免将已删除账号的点赞加入训练。
         {
             "$lookup": {
                 "from": "NetUsers",
-                "localField": "Likes",
+                "localField": user_field,
                 "foreignField": "_id",
                 "as": "user",
             }
@@ -102,7 +107,7 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
         {
             "$group": {
                 "_id": {
-                    "userId": "$Likes",
+                    "userId": f"${user_field}",
                     "chartHash": "$chart.Hash",
                 }
             }
@@ -117,9 +122,29 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
         },
     ]
 
+
+def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
+    """提取当前有效的点赞关系，点赞权重为 1.5。"""
+    # 点赞存放在 ChartVotes，每位用户对每张谱面一条文档；只取 upvote，点踩不参与训练。
+    # UpdatedAt 是最后一次改票的时间，不是点赞发生的时间，因此不用于历史时间切分。
+    votes = _like_pipeline({"Kind": UPVOTE}, "UserId")
+    # 旧版后端把点赞内嵌在 ChartInteracts.Likes；新版后端启动时迁入 ChartVotes 并删除该数组。
+    # 两处都读，后端升级前后都不会丢点赞；迁移中途两边都有的同一对只保留一条。
+    legacy = _like_pipeline(
+        {"Likes.0": {"$exists": True}},
+        "Likes",
+        [{"$unwind": "$Likes"}],  # 将点赞用户数组展开成单个用户—谱面对。
+    )
+
+    pairs: dict[tuple, InteractionPair] = {}
     with MongoClient(uri, uuidRepresentation="standard", tz_aware=True) as client:
-        with client[database_name]["ChartInteracts"].aggregate(pipeline) as cursor:
-            return list(cursor)
+        database = client[database_name]
+        for collection, pipeline in ((VOTE_COLLECTION, votes), (LEGACY_LIKE_COLLECTION, legacy)):
+            with database[collection].aggregate(pipeline) as cursor:
+                for pair in cursor:
+                    # ItemCF 会累加重复坐标，重复的点赞必须在这里去掉，否则权重变成 3.0。
+                    pairs.setdefault((pair["userId"], pair["chartHash"]), pair)
+    return list(pairs.values())
 
 
 def build_itemcf(

@@ -91,8 +91,12 @@ class MongoWriteChecks(unittest.TestCase):
             {"PlayerId": u2, "Hash": "a"},
             {"PlayerId": u2, "Hash": "c"},
         ])
+        # u1 点赞 A、点踩 C 在 ChartVotes；u2 点赞 B 还在旧版内嵌数组里。
+        self.db.ChartVotes.insert_many([
+            {"ChartHash": "a", "UserId": u1, "Kind": 1},
+            {"ChartHash": "c", "UserId": u1, "Kind": -1},
+        ])
         self.db.ChartInteracts.insert_many([
-            {"ChartHash": "a", "Likes": [u1]},
             {"ChartHash": "b", "Likes": [u2]},
         ])
 
@@ -157,6 +161,27 @@ class MongoWriteChecks(unittest.TestCase):
         self.assertEqual(self.db.ChartNeighbors.count_documents({"ModelVersion": version}), 3)
         self.assertEqual(self.db.RecommendationModels.count_documents({"Model": "itemcf", "PublishedAt": {"$ne": None}}), 2)
 
+
+    def test_like_pairs_read_upvotes_and_legacy_likes_once(self):
+        u1, u2, deleted = [ObjectId(f"{i:024x}") for i in range(1, 4)]
+        self.db.MaiCharts.insert_many([{"_id": UUID(int=i), "Hash": h} for i, h in enumerate("abc", start=1)])
+        self.db.NetUsers.insert_many([{"_id": u1}, {"_id": u2}])
+        self.db.ChartVotes.insert_many([
+            {"ChartHash": "a", "UserId": u1, "Kind": 1},
+            {"ChartHash": "c", "UserId": u2, "Kind": 1},
+            {"ChartHash": "b", "UserId": u1, "Kind": -1},  # 点踩不算点赞。
+            {"ChartHash": "c", "UserId": deleted, "Kind": 1},  # 账号已删除。
+            {"ChartHash": "gone", "UserId": u2, "Kind": 1},  # 谱面已删除。
+        ])
+        self.db.ChartInteracts.insert_many([
+            {"ChartHash": "a", "Likes": [u1, u2]},  # u1 与 ChartVotes 重复，只计一次。
+            {"ChartHash": "b", "Upvotes": 3},  # 已迁移的记录没有 Likes 数组。
+        ])
+        pairs = load_like_pairs(self.uri, self.database_name)
+        self.assertEqual(
+            sorted((p["userId"], p["chartHash"], p["weight"]) for p in pairs),
+            [(u1, "a", 1.5), (u2, "a", 1.5), (u2, "c", 1.5)],
+        )
 
     def test_partial_batch_failure_keeps_version_unpublished_and_old_data_unchanged(self):
         save_neighbors(self.uri, self.database_name, {"old": []}, V1)
