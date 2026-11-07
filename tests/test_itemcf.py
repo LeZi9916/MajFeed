@@ -62,7 +62,7 @@ class ItemCFTests(unittest.TestCase):
         self.assertEqual(build_itemcf(repeated), build_itemcf(aggregated))
 
     def test_load_pairs_rejects_other_collections_before_connecting(self):
-        # 只有 Scores 和 PlayHistory 的文档形状已知；其他集合在连接数据库之前就被拒绝。
+        # 只有 Scores 和 PlayHistory 按 PlayerId、ChartId、Timestamp 记录游玩；其他集合在连接数据库之前就被拒绝。
         with self.assertRaisesRegex(ValueError, "ChartVotes"):
             load_pairs("mongodb://127.0.0.1:1", "unused", collection="ChartVotes")
 

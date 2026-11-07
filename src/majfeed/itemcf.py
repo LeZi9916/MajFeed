@@ -26,58 +26,6 @@ PLAY_HISTORY_COLLECTION = "PlayHistory"
 SCORE_COLLECTION = "Scores"
 
 
-def _play_history_stages() -> list[dict]:
-    """游玩记录已按谱面 Id 记录：关联现存谱面，$unwind 会排除已删除谱面的游玩。"""
-    return [
-        {
-            "$lookup": {
-                "from": "MaiCharts",
-                "localField": "ChartId",
-                "foreignField": "_id",
-                "pipeline": [{"$project": {"_id": 1}}],
-                "as": "chart",
-            }
-        },
-        {"$unwind": "$chart"},
-        {"$project": {"userId": "$PlayerId", "chartId": "$chart._id"}},
-    ]
-
-
-def _score_stages() -> list[dict]:
-    """成绩只记 level hash：每个 level hash 归到它的代表谱面，没有现存谱面的 level hash 被排除。"""
-    return [
-        # 每个 level hash 只查一次代表谱面，再展开回各个玩家。
-        {"$group": {"_id": "$LevelHash", "players": {"$addToSet": "$PlayerId"}}},
-        {
-            "$lookup": {
-                "from": "MaiChartMetadata",
-                "localField": "_id",
-                "foreignField": "SHA256",
-                "pipeline": [
-                    {
-                        "$lookup": {
-                            "from": "MaiCharts",
-                            "localField": "ChartId",
-                            "foreignField": "_id",
-                            "pipeline": [{"$project": {"Timestamp": 1}}],
-                            "as": "chart",
-                        }
-                    },
-                    {"$unwind": "$chart"},
-                    # 与 mmfcapi 的 MaiScoreSubmissionService.OrderByRepresentative 相同：
-                    # 最早上传的现存谱面，同时上传时按谱面 Id，再按难度序号。
-                    {"$sort": {"chart.Timestamp": 1, "ChartId": 1, "Level": 1}},
-                    {"$limit": 1},
-                ],
-                "as": "level",
-            }
-        },
-        {"$unwind": "$level"},
-        {"$unwind": "$players"},
-        {"$project": {"userId": "$players", "chartId": "$level.ChartId"}},
-    ]
-
-
 def load_pairs(
     uri: str,
     database_name: str,
@@ -88,13 +36,10 @@ def load_pairs(
 ) -> list[InteractionPair]:
     """提取 [start, end) 内去重后的用户—谱面对，游玩权重为 1.0。
 
-    collection 为 Scores（每位玩家每个 level hash 一条最佳成绩）或 PlayHistory（每次游玩一条）。
+    collection 为 Scores（每位玩家每个 level hash 一条最佳成绩）或 PlayHistory（每次游玩一条），
+    两者都用 ChartId 记录谱面；Scores 的 ChartId 和 Timestamp 都来自该成绩最近一次提交。
     """
-    if collection == SCORE_COLLECTION:
-        chart_stages = _score_stages()
-    elif collection == PLAY_HISTORY_COLLECTION:
-        chart_stages = _play_history_stages()
-    else:
+    if collection not in (SCORE_COLLECTION, PLAY_HISTORY_COLLECTION):
         raise ValueError(f"Unsupported interaction collection: {collection}")
 
     # 先按时间筛选再去重，分别保留训练期和验证期实际出现的交互。
@@ -104,10 +49,19 @@ def load_pairs(
     if end is not None:
         time_filter["$lt"] = end
     pipeline = [{"$match": {"Timestamp": time_filter}}] if time_filter else []
-    pipeline.extend(chart_stages)
     pipeline.extend([
+        # 按谱面 Id 关联现存谱面，$unwind 会排除已删除谱面的成绩和游玩。
+        {
+            "$lookup": {
+                "from": "MaiCharts",
+                "localField": "ChartId",
+                "foreignField": "_id",
+                "as": "chart",
+            }
+        },
+        {"$unwind": "$chart"},
         # 忽略难度差异，同一用户和同一谱面只保留一条游玩关系。
-        {"$group": {"_id": {"userId": "$userId", "chartId": "$chartId"}}},
+        {"$group": {"_id": {"userId": "$PlayerId", "chartId": "$chart._id"}}},
         {
             "$project": {
                 "_id": 0,
@@ -139,7 +93,6 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
                 "from": "MaiCharts",
                 "localField": "ChartId",
                 "foreignField": "_id",
-                "pipeline": [{"$project": {"_id": 1}}],
                 "as": "chart",
             }
         },
@@ -150,7 +103,6 @@ def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
                 "from": "NetUsers",
                 "localField": "UserId",
                 "foreignField": "_id",
-                "pipeline": [{"$project": {"_id": 1}}],
                 "as": "user",
             }
         },

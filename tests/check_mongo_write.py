@@ -24,12 +24,6 @@ from majfeed.publication import cleanup_old_versions, make_model_version, neighb
 V1 = f"{MODEL_NAME}-20261011:000001"
 V2 = f"{MODEL_NAME}-20261011:000002"
 OLD, NEW = UUID(int=0xA0), UUID(int=0xB0)
-UPLOADED = datetime(2025, 1, 1, tzinfo=timezone.utc)
-
-
-def level_hash(name: str) -> str:
-    """测试用 level hash：64 位小写十六进制，与 mmfcapi 的格式相同。"""
-    return name.encode().hex().ljust(64, "0")
 
 
 class MongoWriteChecks(unittest.TestCase):
@@ -43,21 +37,6 @@ class MongoWriteChecks(unittest.TestCase):
     def tearDown(self):
         self.client.drop_database(self.database_name)
         self.client.close()
-
-    def add_chart(self, chart_id: UUID, *level_names: str | None, uploaded: datetime = UPLOADED):
-        """插入一张谱面及其各难度的 level hash（MaiChartMetadata）；None 表示该难度没有 inote。"""
-        self.db.MaiCharts.insert_one({"_id": chart_id, "Timestamp": uploaded})
-        self.add_levels(chart_id, *level_names)
-
-    def add_levels(self, chart_id: UUID, *level_names: str | None):
-        """只写入 MaiChartMetadata，模拟已删除谱面留下的 level hash。"""
-        levels = [
-            {"ChartId": chart_id, "Level": level, "SHA256": level_hash(name)}
-            for level, name in enumerate(level_names)
-            if name is not None
-        ]
-        if levels:
-            self.db.MaiChartMetadata.insert_many(levels)
 
     def test_bson_contract_batching_and_immutable_versions(self):
         low, high = UUID(int=1), UUID("FFFFFFFF-0000-4000-8000-0000000000AB")
@@ -111,14 +90,13 @@ class MongoWriteChecks(unittest.TestCase):
     def test_main_reads_configuration_and_writes_weighted_neighbors(self):
         a, b, c = [UUID(int=i) for i in range(1, 4)]
         u1, u2 = [ObjectId(f"{i:024x}") for i in range(1, 3)]
-        for chart, name in zip((a, b, c), "abc"):
-            self.add_chart(chart, name)
+        self.db.MaiCharts.insert_many([{"_id": chart} for chart in (a, b, c)])
         self.db.NetUsers.insert_many([{"_id": u1}, {"_id": u2}])
         self.db.Scores.insert_many([
-            {"PlayerId": u1, "LevelHash": level_hash("a"), "Timestamp": UPLOADED},
-            {"PlayerId": u1, "LevelHash": level_hash("b"), "Timestamp": UPLOADED},
-            {"PlayerId": u2, "LevelHash": level_hash("a"), "Timestamp": UPLOADED},
-            {"PlayerId": u2, "LevelHash": level_hash("c"), "Timestamp": UPLOADED},
+            {"PlayerId": u1, "ChartId": a},
+            {"PlayerId": u1, "ChartId": b},
+            {"PlayerId": u2, "ChartId": a},
+            {"PlayerId": u2, "ChartId": c},
         ])
         # u1 点赞 A、点踩 C，u2 点赞 B。
         self.db.ChartVotes.insert_many([
@@ -180,17 +158,21 @@ class MongoWriteChecks(unittest.TestCase):
         self.assertEqual(self.db.RecommendationModels.count_documents({"Model": MODEL_NAME, "PublishedAt": {"$ne": None}}), 2)
         self.assertIsNotNone(self.db.RecommendationModels.find_one({"_id": legacy_version}))
 
-        # 删除后重新上传同一份谱面会得到新 Id：成绩按 level hash 归到新谱面（旧谱面的 MaiChartMetadata
-        # 仍在，但谱面已不存在）；投票按旧谱面 Id 记录，不再关联。已发布的近邻仍指向旧 Id，下一轮训练才会按新 Id 生成。
+        # 删除 A 后重新上传同一份谱面会得到新 Id：记在 A 上的成绩和点赞不再关联，
+        # 玩家在新谱面上再次提交后，成绩的 ChartId 才换成新 Id。已发布的近邻仍指向旧 Id，下一轮训练才会按新 Id 生成。
         plays_before = load_pairs(self.uri, self.database_name)
-        self.assertTrue(all(set(pair) == {"userId", "chartId", "weight"} for pair in plays_before))
-        renamed = {old: uuid4() for old in (a, b, c)}
-        self.db.MaiCharts.delete_many({"_id": {"$in": [a, b, c]}})
-        for old, name in zip((a, b, c), "abc"):
-            self.add_chart(renamed[old], name, uploaded=UPLOADED + timedelta(days=1))
-        to_keys = lambda pairs, ids={}: {(p["userId"], ids.get(p["chartId"], p["chartId"]), p["weight"]) for p in pairs}
-        self.assertEqual(to_keys(plays_before, renamed), to_keys(load_pairs(self.uri, self.database_name)))
-        self.assertEqual(load_like_pairs(self.uri, self.database_name), [])
+        likes_before = load_like_pairs(self.uri, self.database_name)
+        self.assertTrue(all(set(pair) == {"userId", "chartId", "weight"} for pair in plays_before + likes_before))
+        renamed = uuid4()
+        self.db.MaiCharts.delete_one({"_id": a})
+        self.db.MaiCharts.insert_one({"_id": renamed})
+        self.db.Scores.update_one({"PlayerId": u1, "ChartId": a}, {"$set": {"ChartId": renamed}})
+        to_keys = lambda pairs: {(p["userId"], p["chartId"], p["weight"]) for p in pairs}
+        self.assertEqual(
+            to_keys(load_pairs(self.uri, self.database_name)),
+            {(u1, renamed, 1.0), (u1, b, 1.0), (u2, c, 1.0)},
+        )
+        self.assertEqual(to_keys(load_like_pairs(self.uri, self.database_name)), {(u2, b, 1.5)})
         self.assertEqual(self.db.ChartNeighbors.find_one({"_id": neighbor_list_id(version, a)})["Neighbors"], docs[a]["Neighbors"])
         self.assertEqual(self.db.ChartNeighbors.count_documents({"ModelVersion": version}), 3)
 
@@ -198,8 +180,7 @@ class MongoWriteChecks(unittest.TestCase):
     def test_like_pairs_read_upvotes_of_existing_charts_and_accounts(self):
         u1, u2, deleted = [ObjectId(f"{i:024x}") for i in range(1, 4)]
         a, b, c, gone = [UUID(int=i) for i in range(1, 5)]
-        for chart in (a, b, c):
-            self.add_chart(chart)
+        self.db.MaiCharts.insert_many([{"_id": chart} for chart in (a, b, c)])
         self.db.NetUsers.insert_many([{"_id": u1}, {"_id": u2}])
         self.db.ChartVotes.insert_many([
             {"ChartId": a, "UserId": u1, "Kind": 1},
@@ -218,64 +199,38 @@ class MongoWriteChecks(unittest.TestCase):
             [(u1, a, 1.5), (u2, a, 1.5), (u2, c, 1.5)],
         )
 
-    def test_score_pairs_go_to_the_representative_chart_of_each_level_hash(self):
+    def test_score_and_play_pairs_use_the_recorded_chart_id(self):
         u1, u2, u3 = [ObjectId(f"{i:024x}") for i in range(1, 4)]
-        early, tie_low, tie_high, late, deleted = [UUID(int=i) for i in (5, 1, 2, 3, 4)]
-        # x：late 的第 4 个难度与 early 的第 3 个难度相同，代表谱面是先上传的 early；
-        # 已删除的 deleted 上传得更早，但谱面不存在，不参与选择。
-        # y：tie_low 与 tie_high 同时上传，按谱面 Id 取 tie_low。z：只属于已删除谱面。
-        # w：late 的两个难度相同，仍归 late。
-        self.add_chart(early, None, None, None, "x", uploaded=UPLOADED)
-        self.add_chart(late, None, None, None, "w", "x", "w", uploaded=UPLOADED + timedelta(days=2))
-        self.add_chart(tie_high, None, "y", uploaded=UPLOADED + timedelta(days=1))
-        self.add_chart(tie_low, None, None, None, None, None, "y", uploaded=UPLOADED + timedelta(days=1))
-        self.add_levels(deleted, "x", "z")
-        recent = UPLOADED + timedelta(days=30)
-        self.db.Scores.insert_many([
-            {"PlayerId": u1, "LevelHash": level_hash("x"), "Timestamp": recent},
-            {"PlayerId": u1, "LevelHash": level_hash("y"), "Timestamp": recent},
-            {"PlayerId": u2, "LevelHash": level_hash("x"), "Timestamp": recent},
-            {"PlayerId": u2, "LevelHash": level_hash("w"), "Timestamp": UPLOADED},
-            {"PlayerId": u3, "LevelHash": level_hash("z"), "Timestamp": recent},
-            {"PlayerId": u3, "LevelHash": level_hash("unknown"), "Timestamp": recent},
-        ])
-
-        pairs = load_pairs(self.uri, self.database_name)
-        self.assertEqual(
-            sorted((p["userId"], p["chartId"], p["weight"]) for p in pairs),
-            sorted([(u1, early, 1.0), (u1, tie_low, 1.0), (u2, early, 1.0), (u2, late, 1.0)]),
-        )
-        # 时间窗口按成绩的 Timestamp 筛选，筛选后再去重。
-        recent_pairs = load_pairs(self.uri, self.database_name, start=recent - timedelta(days=1))
-        self.assertEqual(
-            sorted((p["userId"], p["chartId"]) for p in recent_pairs),
-            sorted([(u1, early), (u1, tie_low), (u2, early)]),
-        )
-
-    def test_play_history_pairs_use_the_chart_of_each_play(self):
-        u1, u2 = [ObjectId(f"{i:024x}") for i in range(1, 3)]
         a, b, gone = [UUID(int=i) for i in range(1, 4)]
-        self.add_chart(a, "a3", "a4")
-        self.add_chart(b, "b")
-        split = UPLOADED + timedelta(days=10)
-        self.db.PlayHistory.insert_many([
+        self.db.MaiCharts.insert_many([{"_id": a}, {"_id": b}])
+        early = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        split = early + timedelta(days=10)
+        records = [
             # 同一谱面的两个难度只算一条游玩关系。
-            {"PlayerId": u1, "ChartId": a, "ChartLevel": 0, "LevelHash": level_hash("a3"), "Timestamp": split},
-            {"PlayerId": u1, "ChartId": a, "ChartLevel": 1, "LevelHash": level_hash("a4"), "Timestamp": split},
-            {"PlayerId": u1, "ChartId": b, "ChartLevel": 0, "LevelHash": level_hash("b"), "Timestamp": UPLOADED},
-            # 谱面已删除的游玩被排除。
-            {"PlayerId": u2, "ChartId": gone, "ChartLevel": 0, "LevelHash": level_hash("gone"), "Timestamp": split},
-        ])
-
-        pairs = load_pairs(self.uri, self.database_name, collection="PlayHistory")
-        self.assertEqual(
-            sorted((p["userId"], p["chartId"], p["weight"]) for p in pairs),
-            [(u1, a, 1.0), (u1, b, 1.0)],
-        )
-        before = load_pairs(self.uri, self.database_name, collection="PlayHistory", end=split)
-        after = load_pairs(self.uri, self.database_name, collection="PlayHistory", start=split)
-        self.assertEqual([(p["userId"], p["chartId"]) for p in before], [(u1, b)])
-        self.assertEqual([(p["userId"], p["chartId"]) for p in after], [(u1, a)])
+            {"PlayerId": u1, "LevelHash": "a-3", "ChartId": a, "Timestamp": split},
+            {"PlayerId": u1, "LevelHash": "a-4", "ChartId": a, "Timestamp": split},
+            # A、B 共用同一个 level hash：按记录里的 ChartId 计入，不按 level hash 推断谱面。
+            {"PlayerId": u2, "LevelHash": "shared", "ChartId": a, "Timestamp": early},
+            {"PlayerId": u3, "LevelHash": "shared", "ChartId": b, "Timestamp": split},
+            # 谱面已删除的记录被排除。
+            {"PlayerId": u3, "LevelHash": "gone", "ChartId": gone, "Timestamp": split},
+        ]
+        for collection in ("Scores", "PlayHistory"):
+            with self.subTest(collection=collection):
+                self.db[collection].insert_many([dict(record) for record in records])
+                pairs = load_pairs(self.uri, self.database_name, collection=collection)
+                self.assertEqual(
+                    sorted((p["userId"], p["chartId"], p["weight"]) for p in pairs),
+                    sorted([(u1, a, 1.0), (u2, a, 1.0), (u3, b, 1.0)]),
+                )
+                # 时间窗口按 Timestamp 筛选，筛选后再去重；Scores 的 Timestamp 是最近一次提交的时间。
+                before = load_pairs(self.uri, self.database_name, collection=collection, end=split)
+                after = load_pairs(self.uri, self.database_name, collection=collection, start=split)
+                self.assertEqual([(p["userId"], p["chartId"]) for p in before], [(u2, a)])
+                self.assertEqual(
+                    sorted((p["userId"], p["chartId"]) for p in after),
+                    sorted([(u1, a), (u3, b)]),
+                )
 
     def test_partial_batch_failure_keeps_version_unpublished_and_old_data_unchanged(self):
         save_neighbors(self.uri, self.database_name, {OLD: []}, V1)

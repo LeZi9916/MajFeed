@@ -56,12 +56,12 @@ docker run --rm --platform linux/amd64 \
 ## 谱面标识与版本更新
 
 训练、评估和近邻回写统一使用谱面 Id（`MaiCharts._id`，UUID）。读取的是 mmfcapi
-`scripts/MigrateLegacyData.cs` 迁移后的数据（TeamMajdata/mmfcapi#44），交互不再带 maidata MD5：
+`scripts/MigrateLegacyData.cs` 迁移后的数据（TeamMajdata/mmfcapi#44），交互不再带 maidata MD5，
+都直接按谱面 Id 关联现存谱面：
 
-- 训练的游玩从 `Scores` 读取。成绩只有 `LevelHash`（一个难度的 inote 文本的 SHA-256），
-  按 `MaiChartMetadata.SHA256` 找到拥有该难度的谱面；多张谱面共用同一 level hash 时，
-  只记在**代表谱面**上，规则与 mmfcapi 记播放数时相同：最早上传的现存谱面，同时上传按谱面 Id，再按难度序号。
-- 评估的游玩从 `PlayHistory` 读取，直接使用其 `ChartId`。
+- 训练的游玩从 `Scores` 读取。每位玩家每个难度（`LevelHash`）一条最佳成绩，`ChartId` 是该成绩
+  最近一次提交时游玩的谱面，`Timestamp` 是那次提交的时间；多张谱面共用同一 level hash 时以 `ChartId` 为准。
+- 评估的游玩从 `PlayHistory` 读取，每次游玩一条，使用其 `ChartId`。
 - 点赞从 `ChartVotes` 中 `Kind = 1`（upvote）的 `ChartId` / `UserId` 读取，点踩不参与训练。
   旧版后端内嵌在 `ChartInteracts.Likes` 的点赞由迁移脚本搬进 `ChartVotes`，不再单独读取。
 
@@ -77,8 +77,8 @@ docker run --rm --platform linux/amd64 \
 - `_id` 里的 ChartId 是小写、带连字符的 36 位文本，与 .NET `Guid.ToString()` 一致。
 - `ChartId` 字段写成 BSON UUID（binary subtype 4），与 `MaiChart._id` 相同；mmfcapi 读取时要用 `GuidRepresentation.Standard`。
 
-删除后重新上传同一份谱面会得到新 Id：成绩按 level hash 归到新谱面，而旧谱面 Id 下的游玩记录和点赞
-不再关联。下一轮训练按新 Id 生成近邻；已发布版本里的旧 Id 不再对应任何谱面。新旧版本同时存在，已发布版本不可修改。
+删除后重新上传同一份谱面会得到新 Id：旧谱面 Id 下的成绩、游玩记录和点赞不再关联，成绩要等玩家在新谱面上
+再次提交才会计入。下一轮训练按新 Id 生成近邻；已发布版本里的旧 Id 不再对应任何谱面。新旧版本同时存在，已发布版本不可修改。
 
 ### 从按 Hash 的 `itemcf` 迁移
 
