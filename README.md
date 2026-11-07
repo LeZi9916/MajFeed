@@ -55,12 +55,18 @@ docker run --rm --platform linux/amd64 \
 
 ## 谱面标识与版本更新
 
-训练、评估和近邻回写统一使用谱面 Id（`MaiCharts._id`，UUID）。游玩和点赞本身仍以
-maidata MD5 为键，读取时按 Hash（区分大小写）关联到当前谱面，再取其 Id：游玩从
-`Scores.Hash` / `PlayHistory.Hash` 读取；点赞从 `ChartVotes` 中 `Kind = 1`（upvote）的
-`ChartHash` / `UserId` 读取，点踩不参与训练。旧版后端内嵌在 `ChartInteracts.Likes` 的点赞
-也会读取，后端启动迁移删掉该数组后自然不再命中，因此新旧后端都能训练。
-仅保留能关联到当前谱面、且账号仍存在的交互，并按用户与谱面 Id 去重。
+训练、评估和近邻回写统一使用谱面 Id（`MaiCharts._id`，UUID）。读取的是 mmfcapi
+`scripts/MigrateLegacyData.cs` 迁移后的数据（TeamMajdata/mmfcapi#44），交互不再带 maidata MD5：
+
+- 训练的游玩从 `Scores` 读取。成绩只有 `LevelHash`（一个难度的 inote 文本的 SHA-256），
+  按 `MaiChartMetadata.SHA256` 找到拥有该难度的谱面；多张谱面共用同一 level hash 时，
+  只记在**代表谱面**上，规则与 mmfcapi 记播放数时相同：最早上传的现存谱面，同时上传按谱面 Id，再按难度序号。
+- 评估的游玩从 `PlayHistory` 读取，直接使用其 `ChartId`。
+- 点赞从 `ChartVotes` 中 `Kind = 1`（upvote）的 `ChartId` / `UserId` 读取，点踩不参与训练。
+  旧版后端内嵌在 `ChartInteracts.Likes` 的点赞由迁移脚本搬进 `ChartVotes`，不再单独读取。
+
+仅保留能关联到现存谱面的交互，点赞还要求账号仍存在，并按用户与谱面 Id 去重。
+在迁移前的数据库上运行会读不到游玩和点赞，应先完成 mmfcapi 的迁移再部署本版。
 输入为 `userId/chartId/weight`，Top-K 返回 `dict[UUID, list[{"chartId": UUID, "score": float}]]`。
 
 每轮开始自动生成 `{model}-yyyyMMdd:HHmmss`（UTC），例如 `itemcf-id-20261012:000001`作为可排序的版本号，方便快速定位新版。
@@ -71,8 +77,8 @@ maidata MD5 为键，读取时按 Hash（区分大小写）关联到当前谱面
 - `_id` 里的 ChartId 是小写、带连字符的 36 位文本，与 .NET `Guid.ToString()` 一致。
 - `ChartId` 字段写成 BSON UUID（binary subtype 4），与 `MaiChart._id` 相同；mmfcapi 读取时要用 `GuidRepresentation.Standard`。
 
-删除后重新上传同一份谱面会得到新 Id，交互仍按 Hash 关联过来，下一轮训练按新 Id 生成近邻；
-已发布版本里的旧 Id 不再对应任何谱面。新旧版本同时存在，已发布版本不可修改。
+删除后重新上传同一份谱面会得到新 Id：成绩按 level hash 归到新谱面，而旧谱面 Id 下的游玩记录和点赞
+不再关联。下一轮训练按新 Id 生成近邻；已发布版本里的旧 Id 不再对应任何谱面。新旧版本同时存在，已发布版本不可修改。
 
 ### 从按 Hash 的 `itemcf` 迁移
 

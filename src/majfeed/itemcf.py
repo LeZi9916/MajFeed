@@ -22,46 +22,92 @@ class Neighbor(TypedDict):
     score: float
 
 
+PLAY_HISTORY_COLLECTION = "PlayHistory"
+SCORE_COLLECTION = "Scores"
+
+
+def _play_history_stages() -> list[dict]:
+    """游玩记录已按谱面 Id 记录：关联现存谱面，$unwind 会排除已删除谱面的游玩。"""
+    return [
+        {
+            "$lookup": {
+                "from": "MaiCharts",
+                "localField": "ChartId",
+                "foreignField": "_id",
+                "pipeline": [{"$project": {"_id": 1}}],
+                "as": "chart",
+            }
+        },
+        {"$unwind": "$chart"},
+        {"$project": {"userId": "$PlayerId", "chartId": "$chart._id"}},
+    ]
+
+
+def _score_stages() -> list[dict]:
+    """成绩只记 level hash：每个 level hash 归到它的代表谱面，没有现存谱面的 level hash 被排除。"""
+    return [
+        # 每个 level hash 只查一次代表谱面，再展开回各个玩家。
+        {"$group": {"_id": "$LevelHash", "players": {"$addToSet": "$PlayerId"}}},
+        {
+            "$lookup": {
+                "from": "MaiChartMetadata",
+                "localField": "_id",
+                "foreignField": "SHA256",
+                "pipeline": [
+                    {
+                        "$lookup": {
+                            "from": "MaiCharts",
+                            "localField": "ChartId",
+                            "foreignField": "_id",
+                            "pipeline": [{"$project": {"Timestamp": 1}}],
+                            "as": "chart",
+                        }
+                    },
+                    {"$unwind": "$chart"},
+                    # 与 mmfcapi 的 MaiScoreSubmissionService.OrderByRepresentative 相同：
+                    # 最早上传的现存谱面，同时上传时按谱面 Id，再按难度序号。
+                    {"$sort": {"chart.Timestamp": 1, "ChartId": 1, "Level": 1}},
+                    {"$limit": 1},
+                ],
+                "as": "level",
+            }
+        },
+        {"$unwind": "$level"},
+        {"$unwind": "$players"},
+        {"$project": {"userId": "$players", "chartId": "$level.ChartId"}},
+    ]
+
+
 def load_pairs(
     uri: str,
     database_name: str,
     *,
-    collection: str = "Scores",
+    collection: str = SCORE_COLLECTION,
     start: datetime | None = None,
     end: datetime | None = None,
 ) -> list[InteractionPair]:
-    """提取 [start, end) 内去重后的用户—谱面对，游玩权重为 1.0。"""
-    pipeline = []
+    """提取 [start, end) 内去重后的用户—谱面对，游玩权重为 1.0。
+
+    collection 为 Scores（每位玩家每个 level hash 一条最佳成绩）或 PlayHistory（每次游玩一条）。
+    """
+    if collection == SCORE_COLLECTION:
+        chart_stages = _score_stages()
+    elif collection == PLAY_HISTORY_COLLECTION:
+        chart_stages = _play_history_stages()
+    else:
+        raise ValueError(f"Unsupported interaction collection: {collection}")
+
     # 先按时间筛选再去重，分别保留训练期和验证期实际出现的交互。
     time_filter = {}
     if start is not None:
         time_filter["$gte"] = start
     if end is not None:
         time_filter["$lt"] = end
-    if time_filter:
-        pipeline.append({"$match": {"Timestamp": time_filter}})
-
-    # 成绩仍以 maidata MD5 为键：按 Hash 关联当前谱面并取其 Id，$unwind 会排除找不到谱面的成绩记录。
-    # 上传时拒绝重复 Hash，一个 Hash 只对应一张现存谱面。
+    pipeline = [{"$match": {"Timestamp": time_filter}}] if time_filter else []
+    pipeline.extend(chart_stages)
     pipeline.extend([
-        {
-            "$lookup": {
-                "from": "MaiCharts",
-                "localField": "Hash",
-                "foreignField": "Hash",
-                "as": "chart",
-            }
-        },
-        {"$unwind": "$chart"},
         # 忽略难度差异，同一用户和同一谱面只保留一条游玩关系。
-        {
-            "$group": {
-                "_id": {
-                    "userId": "$PlayerId",
-                    "chartId": "$chart._id",
-                }
-            }
-        },
+        {"$group": {"_id": {"userId": "$userId", "chartId": "$chartId"}}},
         {
             "$project": {
                 "_id": 0,
@@ -78,42 +124,39 @@ def load_pairs(
 
 
 VOTE_COLLECTION = "ChartVotes"
-LEGACY_LIKE_COLLECTION = "ChartInteracts"
 UPVOTE = 1  # mmfcapi 的 VoteKind.Upvote，枚举按整数存储；点踩为 -1。
 
 
-def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = None) -> list[dict]:
-    """筛选点赞 → 按 Hash 关联当前谱面 → 排除已删除账号 → 按用户与谱面 Id 去重。"""
-    return [
-        {"$match": match},
+def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
+    """提取当前有效的点赞关系，点赞权重为 1.5。"""
+    # 点赞存放在 ChartVotes，每位用户对每张谱面一条文档，按谱面 Id 记录；只取 upvote，点踩不参与训练。
+    # UpdatedAt 是最后一次改票的时间，不是点赞发生的时间，因此不用于历史时间切分。
+    pipeline = [
+        {"$match": {"Kind": UPVOTE}},
+        # 只保留现存谱面；迁移时找不到谱面、仍只有 ChartHash 的投票在这里被排除。
         {
             "$lookup": {
                 "from": "MaiCharts",
-                "localField": "ChartHash",
-                "foreignField": "Hash",
+                "localField": "ChartId",
+                "foreignField": "_id",
+                "pipeline": [{"$project": {"_id": 1}}],
                 "as": "chart",
             }
         },
         {"$unwind": "$chart"},
-        *(expand or []),
         # 只保留仍然存在的账号，避免将已删除账号的点赞加入训练。
         {
             "$lookup": {
                 "from": "NetUsers",
-                "localField": user_field,
+                "localField": "UserId",
                 "foreignField": "_id",
+                "pipeline": [{"$project": {"_id": 1}}],
                 "as": "user",
             }
         },
         {"$unwind": "$user"},
-        {
-            "$group": {
-                "_id": {
-                    "userId": f"${user_field}",
-                    "chartId": "$chart._id",
-                }
-            }
-        },
+        # ItemCF 会累加重复坐标，重复的点赞必须在这里去掉，否则权重变成 3.0。
+        {"$group": {"_id": {"userId": "$UserId", "chartId": "$chart._id"}}},
         {
             "$project": {
                 "_id": 0,
@@ -123,30 +166,9 @@ def _like_pipeline(match: dict, user_field: str, expand: list[dict] | None = Non
             }
         },
     ]
-
-
-def load_like_pairs(uri: str, database_name: str) -> list[InteractionPair]:
-    """提取当前有效的点赞关系，点赞权重为 1.5。"""
-    # 点赞存放在 ChartVotes，每位用户对每张谱面一条文档；只取 upvote，点踩不参与训练。
-    # UpdatedAt 是最后一次改票的时间，不是点赞发生的时间，因此不用于历史时间切分。
-    votes = _like_pipeline({"Kind": UPVOTE}, "UserId")
-    # 旧版后端把点赞内嵌在 ChartInteracts.Likes；新版后端启动时迁入 ChartVotes 并删除该数组。
-    # 两处都读，后端升级前后都不会丢点赞；迁移中途两边都有的同一对只保留一条。
-    legacy = _like_pipeline(
-        {"Likes.0": {"$exists": True}},
-        "Likes",
-        [{"$unwind": "$Likes"}],  # 将点赞用户数组展开成单个用户—谱面对。
-    )
-
-    pairs: dict[tuple, InteractionPair] = {}
     with MongoClient(uri, uuidRepresentation="standard", tz_aware=True) as client:
-        database = client[database_name]
-        for collection, pipeline in ((VOTE_COLLECTION, votes), (LEGACY_LIKE_COLLECTION, legacy)):
-            with database[collection].aggregate(pipeline) as cursor:
-                for pair in cursor:
-                    # ItemCF 会累加重复坐标，重复的点赞必须在这里去掉，否则权重变成 3.0。
-                    pairs.setdefault((pair["userId"], pair["chartId"]), pair)
-    return list(pairs.values())
+        with client[database_name][VOTE_COLLECTION].aggregate(pipeline) as cursor:
+            return list(cursor)
 
 
 def build_itemcf(

@@ -29,8 +29,8 @@ PYTHONPATH=src uv run --locked python -m majfeed.evaluate \
 
 输出还包含训练/验证规模、可评估用户数、命中数，以及被排除的冷用户、
 冷用户交互、老用户的新谱交互和重复游玩数量。没有有效验证目标的用户不参与平均。
-这是基于当前 `MaiCharts` 的历史回测：成绩按 Hash 关联到当前谱面并换成其 Id，
-已删除或变更 Hash 且无法关联的谱面不在结果中。
+这是基于当前 `MaiCharts` 的历史回测：游玩按 `PlayHistory.ChartId` 关联到现存谱面，
+已删除谱面的游玩不在结果中。
 '''
 
 

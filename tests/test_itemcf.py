@@ -4,7 +4,7 @@ from uuid import UUID
 
 from bson import ObjectId
 
-from majfeed.itemcf import build_itemcf
+from majfeed.itemcf import build_itemcf, load_pairs
 
 
 class ItemCFTests(unittest.TestCase):
@@ -60,6 +60,11 @@ class ItemCFTests(unittest.TestCase):
             for pair in self.pairs
         ]
         self.assertEqual(build_itemcf(repeated), build_itemcf(aggregated))
+
+    def test_load_pairs_rejects_other_collections_before_connecting(self):
+        # 只有 Scores 和 PlayHistory 的文档形状已知；其他集合在连接数据库之前就被拒绝。
+        with self.assertRaisesRegex(ValueError, "ChartVotes"):
+            load_pairs("mongodb://127.0.0.1:1", "unused", collection="ChartVotes")
 
     def test_keys_are_the_chart_ids_of_the_pairs(self):
         user = ObjectId(f"{1:024x}")
